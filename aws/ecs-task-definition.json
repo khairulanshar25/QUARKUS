@@ -1,0 +1,64 @@
+{
+  "family": "simple-quarkus-app",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::YOUR_ACCOUNT_ID:role/ecsTaskRole",
+  "containerDefinitions": [
+    {
+      "name": "simple-quarkus-app",
+      "image": "YOUR_ACCOUNT_ID.dkr.ecr.YOUR_REGION.amazonaws.com/simple-quarkus-app:latest",
+      "portMappings": [
+        {
+          "containerPort": 8080,
+          "protocol": "tcp"
+        }
+      ],
+      "essential": true,
+      "environment": [
+        {
+          "name": "QUARKUS_PROFILE",
+          "value": "prod"
+        },
+        {
+          "name": "QUARKUS_LOG_LEVEL",
+          "value": "INFO"
+        },
+        {
+          "name": "QUARKUS_DATASOURCE_JDBC_URL",
+          "value": "jdbc:postgresql://YOUR_RDS_ENDPOINT:5432/inventory_db"
+        },
+        {
+          "name": "QUARKUS_DATASOURCE_USERNAME",
+          "value": "postgres"
+        }
+      ],
+      "secrets": [
+        {
+          "name": "QUARKUS_DATASOURCE_PASSWORD",
+          "valueFrom": "arn:aws:ssm:YOUR_REGION:YOUR_ACCOUNT_ID:parameter/quarkus/db/password"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/simple-quarkus-app",
+          "awslogs-region": "YOUR_REGION",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": [
+          "CMD-SHELL",
+          "curl -f http://localhost:8080/q/health || exit 1"
+        ],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 60
+      }
+    }
+  ]
+}

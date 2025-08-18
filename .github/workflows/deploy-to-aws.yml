@@ -1,0 +1,289 @@
+name: Deploy to AWS ECS
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: simple-quarkus-app
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: inventory_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Java 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Cache Maven dependencies
+      uses: actions/cache@v3
+      with:
+        path: ~/.m2
+        key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
+        restore-keys: ${{ runner.os }}-m2
+
+    - name: Run tests
+      run: ./mvnw clean test
+      env:
+        QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://localhost:5432/inventory_db
+        QUARKUS_DATASOURCE_USERNAME: postgres
+        QUARKUS_DATASOURCE_PASSWORD: postgres
+
+    - name: Build application
+      run: ./mvnw clean package -DskipTests
+
+    - name: Upload test results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: test-results
+        path: target/surefire-reports/
+
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Java 17
+      uses: actions/setup-java@v4
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Get AWS Account ID
+      id: aws-account
+      run: echo "account-id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+    - name: Build application
+      run: ./mvnw clean package -DskipTests
+
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        # Build a docker container and push it to ECR
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+    - name: Create or update database password in SSM
+      run: |
+        if ! aws ssm get-parameter --name "/quarkus/db/password" --region $AWS_REGION 2>/dev/null; then
+          DB_PASSWORD=$(openssl rand -base64 32)
+          aws ssm put-parameter \
+            --name "/quarkus/db/password" \
+            --value "$DB_PASSWORD" \
+            --type "SecureString" \
+            --region $AWS_REGION
+        fi
+
+    - name: Deploy to ECS
+      env:
+        IMAGE_URI: ${{ steps.build-image.outputs.image }}
+        ACCOUNT_ID: ${{ steps.aws-account.outputs.account-id }}
+      run: |
+        # Update the task definition
+        TASK_DEFINITION=$(aws ecs describe-task-definition \
+          --task-definition "dev-simple-quarkus-app" \
+          --query 'taskDefinition' 2>/dev/null || echo '{}')
+        
+        if [ "$TASK_DEFINITION" = "{}" ]; then
+          # Create new task definition from template
+          sed -e "s|YOUR_ACCOUNT_ID|$ACCOUNT_ID|g" \
+              -e "s|YOUR_REGION|$AWS_REGION|g" \
+              aws/ecs-task-definition.json > task-definition.json
+          
+          # Register the task definition
+          aws ecs register-task-definition \
+            --cli-input-json file://task-definition.json
+        else
+          # Update existing task definition
+          NEW_TASK_DEFINITION=$(echo $TASK_DEFINITION | jq --arg IMAGE_URI "$IMAGE_URI" \
+            '.containerDefinitions[0].image = $IMAGE_URI | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.requiresAttributes) | del(.placementConstraints) | del(.compatibilities) | del(.registeredAt) | del(.registeredBy)')
+          
+          echo $NEW_TASK_DEFINITION > task-definition.json
+          
+          # Register the new task definition
+          aws ecs register-task-definition \
+            --cli-input-json file://task-definition.json
+        fi
+
+    - name: Update ECS service
+      run: |
+        # Check if cluster and service exist
+        if aws ecs describe-clusters --clusters "dev-quarkus-cluster" --region $AWS_REGION | grep -q "dev-quarkus-cluster"; then
+          if aws ecs describe-services --cluster "dev-quarkus-cluster" --services "dev-quarkus-service" --region $AWS_REGION | grep -q "dev-quarkus-service"; then
+            # Update existing service
+            aws ecs update-service \
+              --cluster "dev-quarkus-cluster" \
+              --service "dev-quarkus-service" \
+              --task-definition "dev-simple-quarkus-app" \
+              --region $AWS_REGION
+          else
+            echo "ECS service not found. Please deploy infrastructure first."
+            exit 1
+          fi
+        else
+          echo "ECS cluster not found. Please deploy infrastructure first."
+          exit 1
+        fi
+
+    - name: Wait for service stability
+      run: |
+        aws ecs wait services-stable \
+          --cluster "dev-quarkus-cluster" \
+          --services "dev-quarkus-service" \
+          --region $AWS_REGION
+
+    - name: Get application URL
+      id: get-url
+      run: |
+        ALB_DNS=$(aws cloudformation describe-stacks \
+          --stack-name "dev-quarkus-infrastructure" \
+          --region $AWS_REGION \
+          --query 'Stacks[0].Outputs[?OutputKey==`LoadBalancerURL`].OutputValue' \
+          --output text 2>/dev/null || echo "")
+        
+        if [ -n "$ALB_DNS" ]; then
+          echo "app-url=$ALB_DNS" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Test deployment
+      if: steps.get-url.outputs.app-url != ''
+      run: |
+        echo "Testing deployment at: ${{ steps.get-url.outputs.app-url }}"
+        
+        # Wait for the service to be ready
+        sleep 60
+        
+        # Test health endpoint
+        for i in {1..10}; do
+          if curl -f "${{ steps.get-url.outputs.app-url }}/q/health" 2>/dev/null; then
+            echo "✅ Health check passed"
+            break
+          else
+            echo "⏳ Health check failed, retrying in 30 seconds... (attempt $i/10)"
+            sleep 30
+          fi
+        done
+        
+        # Test API endpoint
+        curl -s "${{ steps.get-url.outputs.app-url }}/api/products" | head -c 200
+
+    - name: Notify deployment status
+      if: always()
+      run: |
+        if [ "${{ job.status }}" = "success" ]; then
+          echo "🚀 Deployment successful!"
+          echo "Application URL: ${{ steps.get-url.outputs.app-url }}"
+        else
+          echo "❌ Deployment failed!"
+        fi
+
+  deploy-infrastructure:
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && contains(github.event.head_commit.message, '[deploy-infra]')
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Get AWS Account ID
+      id: aws-account
+      run: echo "account-id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+    - name: Deploy infrastructure
+      env:
+        ACCOUNT_ID: ${{ steps.aws-account.outputs.account-id }}
+      run: |
+        # Create ECR repository if it doesn't exist
+        aws ecr describe-repositories --repository-names $ECR_REPOSITORY --region $AWS_REGION || \
+        aws ecr create-repository --repository-name $ECR_REPOSITORY --region $AWS_REGION
+
+        # Create database password if it doesn't exist
+        if ! aws ssm get-parameter --name "/quarkus/db/password" --region $AWS_REGION 2>/dev/null; then
+          DB_PASSWORD=$(openssl rand -base64 32)
+          aws ssm put-parameter \
+            --name "/quarkus/db/password" \
+            --value "$DB_PASSWORD" \
+            --type "SecureString" \
+            --region $AWS_REGION
+        fi
+
+        # Deploy CloudFormation stack
+        STACK_NAME="dev-quarkus-infrastructure"
+        IMAGE_URI="$ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPOSITORY:latest"
+        
+        if aws cloudformation describe-stacks --stack-name $STACK_NAME --region $AWS_REGION 2>/dev/null; then
+          # Update existing stack
+          aws cloudformation update-stack \
+            --stack-name $STACK_NAME \
+            --template-body file://aws/cloudformation-template.yml \
+            --parameters ParameterKey=Environment,ParameterValue=dev \
+                        ParameterKey=ImageUri,ParameterValue=$IMAGE_URI \
+            --capabilities CAPABILITY_IAM \
+            --region $AWS_REGION
+          
+          aws cloudformation wait stack-update-complete --stack-name $STACK_NAME --region $AWS_REGION
+        else
+          # Create new stack
+          aws cloudformation create-stack \
+            --stack-name $STACK_NAME \
+            --template-body file://aws/cloudformation-template.yml \
+            --parameters ParameterKey=Environment,ParameterValue=dev \
+                        ParameterKey=ImageUri,ParameterValue=$IMAGE_URI \
+            --capabilities CAPABILITY_IAM \
+            --region $AWS_REGION
+          
+          aws cloudformation wait stack-create-complete --stack-name $STACK_NAME --region $AWS_REGION
+        fi
+
+        echo "✅ Infrastructure deployment completed!"
