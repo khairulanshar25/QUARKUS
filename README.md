@@ -197,14 +197,6 @@ docker-compose down && rm -rf DATA/ && docker-compose up -d --build
 
 ### Database Management
 ```bash
-# Check sequence synchronization
-docker exec -it quarkus_postgres psql -U postgres -d inventory_db -c "
-  SELECT 'Max ID: ' || MAX(id) FROM products; 
-  SELECT 'Sequence: ' || last_value FROM products_id_seq;"
-
-# Fix sequence sync (if needed)
-./fix-sequence.sh
-
 # Backup data
 cp -r DATA/ DATA-backup-$(date +%Y%m%d)
 
@@ -310,22 +302,6 @@ curl http://localhost:8080/q/metrics
 ```
 
 ### Common Issues & Solutions
-
-#### 🚨 Duplicate Key Error
-**Symptoms**: `{"details":"Error id xxx","stack":""}`
-
-**Solutions** (fastest to slowest):
-```bash
-# Method 1: Database fix (instant)
-docker exec -it quarkus_postgres psql -U postgres -d inventory_db -c \
-  "SELECT setval('products_id_seq', (SELECT MAX(id) FROM products) + 50);"
-
-# Method 2: Use fix script  
-./fix-sequence.sh
-
-# Method 3: Container restart (15 seconds)
-docker restart simple-quarkus-app && sleep 15
-```
 
 #### 🚨 Container Issues
 ```bash
